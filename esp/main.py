@@ -1,105 +1,112 @@
-# import modules
-from machine import UART
-from machine import Pin
+from machine import UART, Pin, SPI
 import time
 import uasyncio as asyncio
+import my_oled  # OLED Library
 
+# Constants
+MAX_MESSAGE_LEN = 64
+team = [b'W', b'S', b'D', b'A', b'X']
+id = b'W'
+broadcast = b'X'
+led = Pin(2, Pin.OUT)
 
-MAX_MESSAGE_LEN=64
-team = [b'a',b'b',b'c',b'd']
-id = b'a'
-broadcast = 'X'
+# SPI Setup for L9958SB (Motor Driver)
+spi = SPI(1, baudrate=1000000, polarity=0, phase=0, sck=Pin(18), mosi=Pin(23), miso=Pin(19))
+cs_motor1 = Pin(5, Pin.OUT)  # Chip Select for Motor 1
+cs_motor2 = Pin(21, Pin.OUT) # Chip Select for Motor 2
 
-# initialize a new UART class
-uart = UART(2, 9600,tx=17,rx=16)
-# run the init method with more details including baudrate and parity
-uart.init(9600, bits=8, parity=None, stop=1) 
-# define pin 2 as an output with name led. (Pin 2 is connected to the ESP32-WROOM dev board's onboard blue LED)
-led = Pin(2,Pin.OUT)
+# UART Setup
+uart = UART(2, baudrate=9600, tx=17, rx=16)
 
+# Define motor speed mappings
+motor_speed_commands = {
+    b'MotorSpeed0YB': 0,
+    b'MotorSpeed20YB': 20,
+    b'MotorSpeed40YB': 40,
+    b'MotorSpeed60YB': 60,
+    b'MotorSpeed80YB': 80,
+    b'MotorSpeed100YB': 100
+}
 
-def send_message(message):
-    print('ESP: send message')
-    # send_queue.append(message)
+def log(message):
+    """Print and display log messages."""
+    print(f"ESP: {message}")
+    my_oled.print_text(message, 0, 0)  # OLED Display Feedback
+    time.sleep(0.5)
 
-def handle_message(message):
-    my_string = message.decode('utf-8')
-    print('ESP: handling my message',message)
-    
+def send_spi(cs_pin, command, value):
+    """Send SPI command to motor driver."""
+    cs_pin.value(0)  # Select motor driver
+    spi.write(bytearray([command, value]))  # Send command + speed value
+    cs_pin.value(1)  # Deselect motor driver
+    log(f"Sent SPI: CMD {command}, VALUE {value}")
 
+def set_motor_speed(speed):
+    """Control both motors using SPI."""
+    send_spi(cs_motor1, 0x01, speed)  # Send speed to Motor 1
+    send_spi(cs_motor2, 0x01, speed)  # Send speed to Motor 2
 
 async def process_rx():
-
-    # stream = []
+    """Handles UART messages, validates sender/receiver, and forwards valid messages."""
     stream = b''
-    message = b''
-    send_queue = []
-    receiving_message=False
+    receiving_message = False
 
     while True:
-        # read one byte
         c = uart.read(1)
-        # if c is not empty:
-        if c is not None:
+        if c:
+            stream += c
 
-            stream+=c
-            try:
-                if stream[-2:]==b'AZ':
-                    # print('ESP: message start:')
-                    message=stream[-2:-1]
-                    receiving_message=True
-            except IndexError:
-                pass
-            try:
-                if stream[-2:]==b'YB':
-                    message+=stream[-1:]
-                    stream=b''
+            # Detect message start
+            if stream.endswith(b'AZ'):
+                log("Msg Start")
+                receiving_message = True
+
+            # Process known motor speed commands
+            for command, speed in motor_speed_commands.items():
+                if stream.endswith(command):
+                    log(f"Setting Motor Speed: {speed}%")
+                    set_motor_speed(speed)  # Adjust both motors
+                    stream = b''  # Reset stream after successful parsing
                     receiving_message = False
-                    # print('ESP: message received:',message)
-                    handle_message(message)
-                    led.value(led.value()^1)
-            
-            except IndexError:
-                pass
-            
-            if receiving_message:
-                
-                message+=c
 
+            # Detect message end
+            if stream.endswith(b'YB'):
+                log("Message Received")
+                receiving_message = False
 
-                if len(message)==3:
-                    if not (message[2:3] in team):
-                        print('ESP: sender not in team')
+                # Validate sender & receiver before forwarding
+                if len(stream) >= 4:
+                    sender, receiver = stream[-4:-3], stream[-3:-2]
+
+                    if sender in team and receiver in team:
+                        log(f"Forwarding to {receiver}")
+                        uart.write(stream)  # Pass valid message to teammate
                     else:
-                        print('ESP: sender in team')
+                        log("Invalid sender/receiver, discarding message")
 
-                if len(message)==4:
-                    if not (message[3:4] in team):
-                        print('ESP: receiver not in team')
-                    else:
-                        print('ESP: receiver in team')
+                stream = b''  # Reset for next message
 
-                if len(message)>MAX_MESSAGE_LEN:
-                    receiving_message = False
-                    print('ESP: Message too long, aborting')
-                    message=b''
+            # Prevent buffer overflow
+            if len(stream) > MAX_MESSAGE_LEN:
+                log("Message Too Long, Resetting")
+                stream = b''
+                receiving_message = False
 
-
-        await asyncio.sleep_ms(10)    
+        await asyncio.sleep_ms(10)
 
 async def heartbeat():
-
+    """Periodic heartbeat messages over UART."""
     while True:
-        print('ESP: sending')
-        uart.write(b'AZabHello!YB')
-        await asyncio.sleep(10)    
-
-
+        uart.write(b'AZDS444YB')
+        log("Sending Heartbeat")
+        await asyncio.sleep(10)
 
 async def main():
+    """Main async event loop."""
     while True:
         await asyncio.sleep(1)
 
+# Run tasks
 asyncio.create_task(process_rx())
 asyncio.create_task(heartbeat())
 
